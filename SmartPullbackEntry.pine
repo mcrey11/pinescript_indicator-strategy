@@ -1,0 +1,85 @@
+//@version=5
+indicator("Smart Pullback Entry (4H Optimized)", overlay=true)
+
+// === INPUTS === //
+emaLength = input.int(100, title="EMA Trend Filter (4H)")
+swingLookback = input.int(8, title="Swing Pivot Lookback")
+rrMultiple = input.float(3.0, title="Risk:Reward Target", step=0.5)
+showRR = input.bool(true, title="Show TP/SL Zones")
+showTrendLabel = input.bool(true, title="Show Trend Label")
+useStopLoss = input.bool(true, title="Use Stop Loss")
+slATRMult = input.float(1.0, title="Stop Loss Distance (x ATR)", step=0.1)
+
+// === TREND FILTER === //
+ema = ta.ema(close, emaLength)
+bullTrend = close > ema
+bearTrend = close < ema
+plot(ema, color=color.gray, title="EMA")
+
+// === STRUCTURE: BOS/CHOCH LOGIC === //
+pivHigh = ta.pivothigh(high, swingLookback, swingLookback)
+pivLow = ta.pivotlow(low, swingLookback, swingLookback)
+
+var float lastHigh = na
+var float lastLow = na
+var string trend = ""
+var bool bullishCHOCH = false
+var bool bearishCHOCH = false
+
+if not na(pivHigh)
+    bullishCHOCH := not na(lastHigh) and high > lastHigh
+    lastHigh := pivHigh
+if not na(pivLow)
+    bearishCHOCH := not na(lastLow) and low < lastLow
+    lastLow := pivLow
+
+// Detect break of structure or choch
+bosBull = bullishCHOCH
+bosBear = bearishCHOCH
+
+// === ENGULFING CONFIRMATION === //
+bullEngulf = close > open and close > close[1] and open < close[1]
+bearEngulf = close < open and close < close[1] and open > close[1]
+
+// === PULLBACK ENTRY AFTER BOS/CHOCH === //
+longEntry = bosBull and bullTrend and low <= ema and bullEngulf
+shortEntry = bosBear and bearTrend and high >= ema and bearEngulf
+
+plotshape(longEntry, title="Pullback LONG", location=location.belowbar, style=shape.labelup, color=color.lime, text="LONG")
+plotshape(shortEntry, title="Pullback SHORT", location=location.abovebar, style=shape.labeldown, color=color.red, text="SHORT")
+
+// === RR ZONES === //
+var line entryLine = na
+var line slLine = na
+var line tpLine = na
+
+atr = ta.atr(14)
+
+if showRR and longEntry
+    entry = close
+    sl = entry - atr * slATRMult
+    tp = entry + (entry - sl) * rrMultiple
+    if useStopLoss
+        slLine := line.new(bar_index, sl, bar_index + 20, sl, color=color.red, style=line.style_dotted)
+    entryLine := line.new(bar_index, entry, bar_index + 20, entry, color=color.lime, style=line.style_dashed)
+    tpLine := line.new(bar_index, tp, bar_index + 20, tp, color=color.green, style=line.style_solid)
+
+if showRR and shortEntry
+    entry = close
+    sl = entry + atr * slATRMult
+    tp = entry - (sl - entry) * rrMultiple
+    if useStopLoss
+        slLine := line.new(bar_index, sl, bar_index + 20, sl, color=color.green, style=line.style_dotted)
+    entryLine := line.new(bar_index, entry, bar_index + 20, entry, color=color.red, style=line.style_dashed)
+    tpLine := line.new(bar_index, tp, bar_index + 20, tp, color=color.lime, style=line.style_solid)
+
+// === TREND LABEL DISPLAY === //
+var label trendLbl = na
+if showTrendLabel
+    label.delete(trendLbl)
+    trendLbl := label.new(bar_index, na, text="BOS: " + (bosBull ? "BULLISH" : bosBear ? "BEARISH" : ""), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.black, textcolor=color.white)
+    label.set_y(trendLbl, high + ta.tr)
+
+// === ALERTS === //
+alertcondition(longEntry, title="Long Entry Alert", message="Smart Pullback LONG Signal on 4H")
+alertcondition(shortEntry, title="Short Entry Alert", message="Smart Pullback SHORT Signal on 4H")
