@@ -1,105 +1,143 @@
-Options (choose one)
+Below is a concise, clear wrap-up of how the strategy decides to enter, close, set stop-loss and take-profit — including the EMA-exit add-on, trailing stops, buffers, and webhook behavior. I reference the variable names used in the script so you can map each rule back to the code quickly.
 
-A — Webhook-only (no strategy trades): you only want alerts sent to PineConnector and do NOT want the Pine script to place strategy.entry orders. Useful when PineConnector / your broker executes the real orders and you only want Pine to generate signals.
-B — Strategy + webhook: you want the strategy to still place backtest / paper trades in TradingView AND also send the webhook. (This is what the current script does, but I can refine timing/cooldown.)
-C — Use strategy orders differently: place limit/stop orders from Pine (strategy.order with limit/stop) rather than immediate market entry. Use this if you want entries at specific price levels.
-Which one do you want? Below are ready-to-paste code snippets and a short explanation for each.
+High-level summary
+Entry logic: Variant 5 (Conservative) — a one-bar confirmed MACD crossover + histogram momentum + above-average volume + confirming candle above/below 50 EMA + optional MACD strength filter + session/volatility checks.
+Stop-loss / Take-profit: percent-based SL and TP (computed from entry price) with a configurable small tick buffer. Applied via strategy.exit() (fixed or with trailing).
+Trailing stop: optional; implemented as a trailing stop in price units (computed from trailPercent of entry price).
+EMA counter-trend exit: optional; two modes:
+Market Close: immediately close the position when price crosses the EMA against the trade.
+Set Stop at EMA: attach/update a protective stop at the EMA level (plus/minus buffer).
+Webhook behavior: when a trade is entered/exited (and if sendAlertsFromScript = true), the script calls alert(payload, ...) with either PineConnector CSV or JSON payload. TradingView alert must be configured to trigger on "Any alert() function call" and send to your PineConnector webhook.
+Entry conditions (long and short) These are the boolean variables used:
+crossover_onebar
 
-A — Webhook-only (remove strategy.entry)
+In code: (macdLine[1] > signalLine[1]) and (macdLine[2] <= signalLine[2])
+Meaning: the MACD line crossed above the signal line on the previous bar (one-bar confirmation).
+histRising / histFalling
 
-Behavior: script will never place strategy.entry orders. It only sends alert(payload, ...) when the signal triggers. Useful when PineConnector is the only executor.
-Replace the entry blocks with this:
+histRising: histLine > 0 and ta.change(histLine) > 0
+histFalling: histLine < 0 and ta.change(histLine) < 0
+Meaning: MACD histogram is on the expected side and increasing magnitude.
+volOk
 
-pine
-// WEBHOOK-ONLY: no strategy.entry calls, only send alert payloads
-if (buyCond and lastSignalSent != "BUY")
-    // only alert — PineConnector will execute the trade
-    if sendAlertsFromScript
-        alert(payload_buy, alert.freq_once_per_bar_close)
-    lastSignalSent := "BUY"
+volOk: volume > ta.sma(volume, 20)
+Meaning: volume above 20-bar average on the signal bar.
+confirmBull / confirmBear
 
-if (sellCond and lastSignalSent != "SELL")
-    if sendAlertsFromScript
-        alert(payload_sell, alert.freq_once_per_bar_close)
-    lastSignalSent := "SELL"
+confirmBull: close > open and close > emaTrend and close > high[1]
+confirmBear: close < open and close < emaTrend and close < low[1]
+Meaning: the signal bar is a confirming candle oriented with the trade and above/below the EMA and stronger than previous bar.
+strengthPassBuy / strengthPassSell
 
-// optional: reset lastSignalSent after N bars if you want to re-send same side later
-var int barsSinceSignal = 0
-if lastSignalSent == "NONE"
-    barsSinceSignal := 0
-else
-    barsSinceSignal += 1
-// e.g. allow resend after 3 bars:
-if barsSinceSignal >= 3
-    lastSignalSent := "NONE"
-Notes for A:
+strengthPassBuy: (not useFilter) or (macdLine > strengthLevel)
+strengthPassSell: (not useFilter) or (macdLine < -strengthLevel)
+Meaning: optional numeric MACD threshold for extra strength.
+validMarket
 
-Create a TradingView alert with Condition = this indicator and choose "Any alert() function call", set the PineConnector webhook URL.
-Advantage: no double-execution risk between strategy and PineConnector. Backtest results inside TradingView will be meaningless (no entries), but you can still use the script for signals only.
-B — Strategy + webhook but better cooldown and send webhook only once per actual order
+True when session filter and optional volatility filter allow trading.
+Final entry booleans:
 
-Current script places strategy.entry and sends alert at same time. If PineConnector takes time to execute and you want to avoid re-sends while you have an open position, use the position check to stop re-sending and reset only when position closes (or after X bars). Use this version if you want both TradingView backtests and real trade execution via PineConnector.
-Replace the entry blocks with this:
+buyCond = crossover_onebar and histRising and volOk and confirmBull and strengthPassBuy and validMarket
+sellCond = crossunder_onebar and histFalling and volOk and confirmBear and strengthPassSell and validMarket
+Note: Because calc_on_every_tick=false the conditions evaluate at bar close.
 
-pine
-// STRATEGY + WEBHOOK: place tradingview entry and send webhook once per open-position lifecycle
-if (buyCond and strategy.position_size == 0 and lastSignalSent != "BUY")
-    strategy.entry("LONG_ENTRY", strategy.long, qty = orderSize)
-    if sendAlertsFromScript
-        alert(payload_buy, alert.freq_once_per_bar_close)
-    lastSignalSent := "BUY"
+Entry execution & duplicate prevention
+When buyCond / sellCond are true and strategy.position_size == 0, script does:
+strategy.entry("LONG_ENTRY", strategy.long, qty = orderSize) or strategy.entry("SHORT_ENTRY", strategy.short, qty = orderSize)
+Sends a dynamic webhook payload via alert(payload_buy/payload_sell) if sendAlertsFromScript = true.
+The script uses var string lastSignalSent to avoid re-sending the same entry signal repeatedly while the position is open. lastSignalSent is reset to "NONE" when strategy.position_size == 0.
+Optional retry logic (commented) can re-enable sending after N bars if an external executor fails to open the position.
+Stop-loss and take-profit calculation (Percent mode)
+Input variables:
+stopLossValue (percent), takeProfitValue (percent)
+bufferTicks (integer) → buf = bufferTicks * syminfo.mintick
+At entry price entryPrice (the script uses strategy.position_avg_price once in position), prices are computed:
+For a long:
 
-// send for short
-if (sellCond and strategy.position_size == 0 and lastSignalSent != "SELL")
-    strategy.entry("SHORT_ENTRY", strategy.short, qty = orderSize)
-    if sendAlertsFromScript
-        alert(payload_sell, alert.freq_once_per_bar_close)
-    lastSignalSent := "SELL"
+longStop := entryPrice * (1 - stopLossValue / 100) - buf
+Effect: a price below entry by stopLossValue% minus small tick buffer.
+longTP := entryPrice * (1 + takeProfitValue / 100)
+For a short:
 
-// Reset logic: only reset after the position actually closes
-if (strategy.position_size == 0)
-    lastSignalSent := "NONE"
-Refinements you might want:
+shortStop := entryPrice * (1 + stopLossValue / 100) + buf
 
-If PineConnector can fail, you might want a retry flow: reset lastSignalSent after N bars so the script will re-send the webhook if position didn't open externally. (Add barsSinceSignal counter similar to A.)
-If PineConnector requires a unique order ID per signal, include time or an incrementing id in the payload.
-C — Place limit/stop entry orders from Pine (strategy.order) and send webhook for info only
+Effect: a price above entry by stopLossValue% plus buffer.
+shortTP := entryPrice * (1 - takeProfitValue / 100)
 
-Use strategy.order with limit or stop price. Example placing a buy-limit at current close - delta (or at next bar open is typical in backtest).
-Example placing a limit buy slightly below close:
+These are applied with strategy.exit(..., stop=..., limit=...) for each side while strategy.position_size != 0.
 
-pine
-limitDelta = 0.002 * close  // 0.2% below current close, adjust as needed
-buyLimitPrice = close - limitDelta
+Trailing stop
+If useTrailingStop is true:
+trailPointsLong := entryPrice * (trailPercent / 100)
+trailPointsShort := entryPrice * (trailPercent / 100)
+Then strategy.exit uses trail_points=trailPointsLong/Short when not na. trail_points expects price distance (the script supplies absolute price distance computed from the entry price and trailPercent).
+Note: trail_points is an absolute price distance (not percent) in this implementation — we convert percent->price using the entry price.
+EMA counter-trend exit (new scenario)
+Inputs:
+emaExitEnabled: boolean
+emaExitMode: "Market Close" or "Set Stop at EMA"
+emaExitBufferTicks: ticks to offset the protective stop
+emaExitSendWebhook: whether to send a webhook on EMA exit events
+Detection:
+emaCrossDown := ta.crossunder(close, emaTrend) // price crossed below EMA
+emaCrossUp := ta.crossover(close, emaTrend) // price crossed above EMA
+Behavior when a position exists:
+For a long (position_size > 0):
+If emaExitMode == "Market Close" and emaCrossDown occurs → strategy.close("LONG_ENTRY") and optional webhook EXIT payload sent.
+If emaExitMode == "Set Stop at EMA" → compute ema_stop_long = emaTrend - (emaExitBufferTicks * tick) and call strategy.exit(id="EMA_PROT_LONG", from_entry="LONG_ENTRY", stop=ema_stop_long). The protective stop is updated every bar.
+For a short (position_size < 0):
+If emaExitMode == "Market Close" and emaCrossUp occurs → strategy.close("SHORT_ENTRY")
+If emaExitMode == "Set Stop at EMA" → ema_stop_short = emaTrend + buffer and strategy.exit(... stop=ema_stop_short)
+Notes:
 
-if (buyCond and strategy.position_size == 0 and lastSignalSent != "BUY")
-    strategy.order(id="LONG_LIMIT", long=true, qty=orderSize, limit=buyLimitPrice)
-    if sendAlertsFromScript
-        alert(payload_buy, alert.freq_once_per_bar_close)
-    lastSignalSent := "BUY"
-Notes for C:
+The "Set Stop at EMA" mode keeps attaching/updating a protective stop at EMA so that when price reaches EMA the broker triggers the stop order (acting as a counter-trend protective guard).
+The "Market Close" mode issues an immediate close — in backtest this is strategy.close; when used with PineConnector you should also send an EXIT webhook so your external executor knows the signal.
+Webhook payloads / alerts
+Two payload formats selectable by connectorFormat:
+PineConnector CSV (default): example line format used in script: pine_license_id + ",BUY," + symbol + "," + orderSize + "," + sl_price + "," + tp_price + ",auto" Example: 8426965401813,BUY,XAUUSD,0.10,1840.50,1860.00,auto
+JSON (custom): example: {"action":"BUY","symbol":"XAUUSD","size":0.1,"entry_price":1850.00,"sl_price":1840.5,"tp_price":1860.0}
+The script builds payload_buy and payload_sell strings at top-level and calls:
+alert(payload_buy, alert.freq_once_per_bar_close)
+Important: alert(payload, ...) uses a series string and must be delivered by creating a TradingView alert that listens to "Any alert() function call" and points to your PineConnector webhook URL.
+alertcondition() is present in the script but its message is a constant token (e.g., "PINE_BUY" / "PINE_SELL") because alertcondition(message=...) requires a compile-time constant. Use these only if you want a constant, small token or a UI-visible alert.
+How exits interact (order of precedence)
+EMA-exit Market Close triggers a strategy.close(...) which closes the position immediately and therefore cancels open strategy.exit protective orders.
+EMA-exit "Set Stop at EMA" is implemented via strategy.exit(...) with a stop. This is an additional exit in parallel to the percent-based stop/tp/trailing stop. The broker will act on whichever stop/limit is hit first; in the script, both the percent stop and the EMA protective stop can coexist (different strategy.exit ids).
+strategy.exit for regular percent-based stop/TP are attached while position exists (id: LONG_EXIT/SHORT_EXIT).
+Trailing stop (if provided) is applied via strategy.exit(..., trail_points=...) as part of LONG_EXIT/SHORT_EXIT.
+Implementation details / constants and helpers
+syminfo.mintick → smallest price unit (tick)
+buf = bufferTicks * syminfo.mintick → small buffer added/subtracted to stops to avoid immediate hit at market micro-prices
+Prices are formatted with format.mintick when used in payload strings.
+All condition-check plotting (plotshape) is declared at top-level and gated with showChecks (plotshape(showChecks and condition, ...)) because Pine disallows plotting calls inside local blocks.
+Example numeric calculation (long)
+Inputs for example:
+entryPrice = 1850.00
+stopLossValue = 1.0 (%)
+takeProfitValue = 2.0 (%)
+bufferTicks = 2; assume syminfo.mintick = 0.01 → buf = 0.02
+Computed:
+SL price = 1850 * (1 - 0.01) - 0.02 = 1850 * 0.99 - 0.02 = 1831.5 - 0.02 = 1831.48
+TP price = 1850 * 1.02 = 1887.00
+trailPointsLong (if trailPercent=0.8) = 1850 * 0.008 = 14.8 (so trailing stop distance = 14.8 price units)
+The strategy will call strategy.exit(id="LONG_EXIT", from_entry="LONG_ENTRY", stop=1831.48, limit=1887.00, trail_points=14.8) (trail_points included only if enabled)
+Practical checklist to verify behavior in your environment
+For live/external execution via PineConnector → MT5:
+Confirm TradingView alert uses condition "Any alert() function call" and URL is your PineConnector webhook.
+Confirm pine_license_id (if required) is correct for PineConnector CSV.
+Confirm symbol mapping in PineConnector to your MT5 broker symbol (e.g., XAUUSD vs GOLD vs XAUUSDm).
+Confirm SL/TP units expected by your EA (price vs pips vs percent); adjust script payload accordingly.
+Test with manual curl payloads to PineConnector first, then with script alert send on a demo account.
+For backtesting/visual:
+Leave strategy.entry calls enabled so the TradingView strategy simulates fills and the table shows P/L and Position state.
+Use showChecks = true to debug which subchecks are passing.
+Suggested small improvements you might add
+Grace period for EMA exit: require N bars after entry before EMA-exit is allowed to avoid immediate whipsaw exits.
+Add an order_id or timestamp in webhook payload so your connector/EA can deduplicate.
+Add unit selection for SL/TP payloads (price vs pips vs percent) to match EA expectations.
+Optional automatic retry logic (resend webhook after N bars if no external position opened).
+If you want, I can:
 
-strategy.order with limit places a limit order in the backtest; behavior in real-time depends on calc_on_every_tick and other factors.
-You can also use stop orders (strategy.order with stop parameter).
-If you prefer, I can:
-
-Produce a full script implementing the Webhook-only version (A) so nothing is entered by TradingView and PineConnector handles all execution.
-Or produce a full script implementing Version B with an automatic retry after N bars if a position didn't open externally (useful if PineConnector fails occasionally).
-Or implement version C with configurable limit/stop offsets and a debug flag to show payloads on the chart.
-
-
-Variant 5 (the conservative entry logic) into a complete Pine v5 strategy file and kept the PineConnector webhook support and exit/stop logic intact.
-
-(short):
-
-Replaced the previous buy/sell conditions with the conservative Variant 5 logic: one-bar MACD confirmation + histogram momentum rising/falling + above-average volume + confirming candle relative to EMA + optional MACD strength filter. This reduces false entries and delays entry by one bar after the crossover (more robust).
-Kept webhook payloads (CSV/JSON) and dynamic alert(payload, ...) calls. alertcondition() remains top-level with constant messages (required by Pine).
-Added a showChecks debug toggle to plot small markers for the sub-checks and a dashboard table row that shows which subchecks passed on the current bar so you can visually verify why the strategy did or didn't enter.
-Preserved stop/TP/trailing-stop logic and single-entry-per-position lifecycle behavior (lastSignalSent prevents duplicate sends until position closes).
-How to test it quickly:
-
-Load the script in TradingView on the symbol/timeframe you trade.
-Use a timeframe where MACD/EMA behavior is meaningful (e.g., 15m, 1h).
-Keep sendAlertsFromScript = true and create one TradingView Alert with Condition = this indicator and "Any alert() function call" and set your PineConnector webhook URL. The script will call alert(payload, ...) when a trade is placed and push the dynamic CSV/JSON to the webhook.
-Use the showChecks toggle to see markers and the dashboard to confirm which part blocked/allowed the entry.
-If you want the script to only send webhooks and NOT place paper/backtest trades in TradingView, I can remove strategy.entry calls and keep only alert(payload, ...). Tell me and I will provide that version.
+Produce a one-page quick reference table (CSV) of the exact variable → formula mappings for copy/paste into documentation or README.
+Modify payload to match the exact PineConnector CSV schema your connector instance expects (paste a working CSV example from the PineConnector log and I’ll adapt the script).
+Add an EMA-exit grace period (require N bars after entry) and return the updated script.
