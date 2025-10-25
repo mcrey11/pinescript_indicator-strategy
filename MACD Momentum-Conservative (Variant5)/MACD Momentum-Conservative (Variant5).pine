@@ -1,0 +1,400 @@
+//@version=5
+strategy("MACD Momentum — Conservative (Variant 5) — PineConnector-ready (TP-detection fixed)", 
+     overlay=true, margin_long=100, margin_short=100, initial_capital=10000, 
+     commission_type=strategy.commission.percent, commission_value=0.02, calc_on_every_tick=false)
+
+// =====================
+// === USER INPUTS ====
+// =====================
+// MACD & Trend
+fastLength    = input.int(12, "MACD Fast EMA", minval=1)
+slowLength    = input.int(26, "MACD Slow EMA", minval=1)
+signalLength  = input.int(6,  "MACD Signal EMA", minval=1)
+emaLength     = input.int(50, "Trend EMA Length", minval=1)
+strengthLevel = input.float(1.5, "MACD Strength Filter", step=0.1)
+useFilter     = input.bool(true, "Use MACD Strength Filter?")
+
+// Volatility
+useVolatility = input.bool(false, "Enable Volatility Filter?")
+atrLength     = input.int(14, "ATR Length", minval=1)
+atrMult       = input.float(0.5, "ATR Threshold Multiplier", step=0.1)
+
+// Session Filter
+useSessionFilter = input.bool(false, "Enable Session Filter?")
+sessionTime      = input.session("0000-2359", "Active Session (Broker Time)")
+
+// Risk / Stops
+useStops          = input.bool(true, "Enable Stop-Loss / Take-Profit?")
+stopType          = input.string("Percent", "Stop Type", options=["Percent", "Profit/Loss"])
+stopLossValue     = input.float(1.0, "Stop Loss (%) or P/L", step=0.1)
+takeProfitValue   = input.float(2.0, "Take Profit (%) or P/L", step=0.1)
+useTrailingStop   = input.bool(true, "Enable Trailing Stop?")
+trailPercent      = input.float(0.8, "Trailing Stop (%)", step=0.1)
+bufferTicks       = input.int(2, "Stop buffer (ticks)", minval=0)  // small buffer to avoid immediate hit
+
+// Orders / Webhook / PineConnector specifics
+orderSize         = input.float(0.1, "Order Size (lots/contracts)", step=0.01)
+sendAlertsFromScript = input.bool(true, "Send alert() from script? (create a TradingView alert for 'Any alert() function call')")
+connectorFormat   = input.string("PineConnector CSV", "Webhook format", options=["PineConnector CSV", "JSON (custom)"])
+pine_license_id   = input.string("", "PineConnector License ID (if applicable)")
+
+// Debug / visual helpers
+showChecks = input.bool(true, "Show condition checks on chart?")
+
+// --- Post-TP detection tuning (tolerance) ---
+tolTicksAfterTP = input.int(3, "TP match tolerance (ticks)", minval=0)
+
+// =====================
+// === INDICATORS =====
+// =====================
+[macdLine, signalLine, histLine] = ta.macd(close, fastLength, slowLength, signalLength)
+emaTrend = ta.ema(close, emaLength)
+
+// =====================
+// === FILTERS =========
+// =====================
+bullTrend = close > emaTrend
+bearTrend = close < emaTrend
+
+atrValue = ta.atr(atrLength)
+atrThreshold = ta.sma(atrValue, 50) * atrMult
+highVolatility = atrValue > atrThreshold
+
+inSession = (not useSessionFilter) or (time(timeframe.period, sessionTime) != na)
+validMarket = (not useVolatility or highVolatility) and inSession
+
+// =====================
+// === VARIANT 5: CONSERVATIVE ENTRY LOGIC ===
+// Conservative: combine momentum + candle + volume + one-bar confirmation
+
+// 1) Momentum confirmation: histogram on the correct side and rising/falling
+histRising  = histLine > 0 and ta.change(histLine) > 0
+histFalling = histLine < 0 and ta.change(histLine) < 0
+
+// 2) Volume confirmation
+volSMA = ta.sma(volume, 20)
+volOk = volume > volSMA
+
+// 3) One-bar confirmation for MACD crossover/crossunder (happened last bar)
+crossover_onebar = (macdLine[1] > signalLine[1]) and (macdLine[2] <= signalLine[2])
+crossunder_onebar = (macdLine[1] < signalLine[1]) and (macdLine[2] >= signalLine[2])
+
+// 4) Candle confirmation: bullish/bearish confirming candle (close > open and above EMA, etc.)
+confirmBull = (close > open) and (close > emaTrend) and (close > high[1])
+confirmBear = (close < open) and (close < emaTrend) and (close < low[1])
+
+// 5) Strength filter (optional)
+strengthPassBuy  = (not useFilter) or (macdLine > strengthLevel)
+strengthPassSell = (not useFilter) or (macdLine < -strengthLevel)
+
+// Compose final conservative conditions
+buyCond_raw  = crossover_onebar and histRising and volOk and confirmBull and strengthPassBuy and validMarket
+sellCond_raw = crossunder_onebar and histFalling and volOk and confirmBear and strengthPassSell and validMarket
+
+// =====================
+// === HELPERS / PAYLOADS ===
+tick = syminfo.mintick
+buf = bufferTicks * tick
+symbol_out = syminfo.ticker
+
+f_format_price(_p) =>
+    str.tostring(_p, format.mintick)
+
+// current bar-close entry price (used for alert payloads)
+entryPrice_now = close
+
+// compute percent-based SL/TP at current price (used for the alert payload)
+sl_price_long_now = entryPrice_now * (1 - stopLossValue / 100) - buf
+tp_price_long_now = entryPrice_now * (1 + takeProfitValue / 100)
+sl_price_short_now = entryPrice_now * (1 + stopLossValue / 100) + buf
+tp_price_short_now = entryPrice_now * (1 - takeProfitValue / 100)
+
+trailPoints_long_now = useTrailingStop ? (entryPrice_now * (trailPercent / 100)) : na
+trailPoints_short_now = useTrailingStop ? (entryPrice_now * (trailPercent / 100)) : na
+
+f_null_or_price(_p) =>
+    na(_p) ? "NULL" : f_format_price(_p)
+
+pine_csv_buy = pine_license_id + "," + "BUY" + "," + symbol_out + "," + str.tostring(orderSize, format.mintick) + "," + f_null_or_price(sl_price_long_now) + "," + f_null_or_price(tp_price_long_now) + "," + "auto"
+pine_csv_sell = pine_license_id + "," + "SELL" + "," + symbol_out + "," + str.tostring(orderSize, format.mintick) + "," + f_null_or_price(sl_price_short_now) + "," + f_null_or_price(tp_price_short_now) + "," + "auto"
+
+json_buy = '{' +
+  '"action":"BUY",' +
+  '"symbol":"' + symbol_out + '",' +
+  '"size":' + str.tostring(orderSize, format.mintick) + ',' +
+  '"entry_price":' + f_format_price(entryPrice_now) + ',' +
+  '"sl_pct":' + str.tostring(stopLossValue) + ',' +
+  '"tp_pct":' + str.tostring(takeProfitValue) + ',' +
+  '"sl_price":' + f_format_price(sl_price_long_now) + ',' +
+  '"tp_price":' + f_format_price(tp_price_long_now) +
+  '}'
+
+json_sell = '{' +
+  '"action":"SELL",' +
+  '"symbol":"' + symbol_out + '",' +
+  '"size":' + str.tostring(orderSize, format.mintick) + ',' +
+  '"entry_price":' + f_format_price(entryPrice_now) + ',' +
+  '"sl_pct":' + str.tostring(stopLossValue) + ',' +
+  '"tp_pct":' + str.tostring(takeProfitValue) + ',' +
+  '"sl_price":' + f_format_price(sl_price_short_now) + ',' +
+  '"tp_price":' + f_format_price(tp_price_short_now) +
+  '}'
+
+payload_buy  = connectorFormat == "PineConnector CSV" ? pine_csv_buy : json_buy
+payload_sell = connectorFormat == "PineConnector CSV" ? pine_csv_sell : json_sell
+
+// =====================
+// === PLOTTING CHECKS (TOP-LEVEL) ===
+// plotshape must be declared at top-level. Gate drawing with showChecks.
+plotshape(showChecks and crossover_onebar, title="MACD xbar",    location=location.belowbar, color=color.yellow, style=shape.circle,     size=size.tiny)
+plotshape(showChecks and histRising,       title="Hist Rising", location=location.belowbar, color=color.green,  style=shape.square,     size=size.tiny)
+plotshape(showChecks and volOk,            title="Vol OK",      location=location.belowbar, color=color.blue,   style=shape.cross,      size=size.tiny)
+plotshape(showChecks and confirmBull,      title="Candle OK",   location=location.belowbar, color=color.aqua,   style=shape.triangleup, size=size.tiny)
+
+// =====================
+// === ALERTCONDITIONS ===
+// Use constant messages for alertcondition. For dynamic payloads, use alert(...)
+alertcondition(true and buyCond_raw and strategy.position_size == 0, title="Buy Signal (const)", message="PINE_BUY")
+alertcondition(true and sellCond_raw and strategy.position_size == 0, title="Sell Signal (const)", message="PINE_SELL")
+
+// =====================
+// === POST-TP DETECTION VARIABLES ===
+// These track the last planned TP/SL and detect whether the last exit was a TP.
+var float lastPlannedTP = na
+var float lastPlannedSL = na
+var int   lastTPBar     = na
+var float lastTPPrice   = na
+var int   barsSinceTP   = 9999
+var bool  lastExitWasTP = false
+
+// prevPosSize must be float because strategy.position_size is float (fractional lots)
+var float prevPosSize = na
+
+// =====================
+// === ENTRY EXECUTION & ALERTS ===
+// persistent flag to avoid duplicate sends until position lifecycle completes
+var string lastSignalSent = "NONE"
+
+if (buyCond_raw and strategy.position_size == 0 and lastSignalSent != "BUY")
+    // place paper/backtest trade and send webhook
+    strategy.entry("LONG_ENTRY", strategy.long, qty = orderSize)
+    // store planned TP/SL for TP detection later
+    lastPlannedTP := tp_price_long_now
+    lastPlannedSL := sl_price_long_now
+    if sendAlertsFromScript
+        alert(payload_buy, alert.freq_once_per_bar_close)
+    lastSignalSent := "BUY"
+
+if (sellCond_raw and strategy.position_size == 0 and lastSignalSent != "SELL")
+    strategy.entry("SHORT_ENTRY", strategy.short, qty = orderSize)
+    lastPlannedTP := tp_price_short_now
+    lastPlannedSL := sl_price_short_now
+    if sendAlertsFromScript
+        alert(payload_sell, alert.freq_once_per_bar_close)
+    lastSignalSent := "SELL"
+
+// reset after position closed so same-side signals can re-fire later
+if (strategy.position_size == 0)
+    lastSignalSent := "NONE"
+
+// =====================
+// === TP / Exit Detection (fixed prevPosSize handling) ===
+// We detect a transition prevPosSize -> strategy.position_size and check if a close happened this bar.
+// This block must inspect prevPosSize BEFORE updating it to the current position_size.
+
+if na(prevPosSize)
+    // initialize on first meaningful bar
+    prevPosSize := strategy.position_size
+
+// Detect transition: previous != current and current is zero => position closed this bar
+if not na(prevPosSize) and prevPosSize != strategy.position_size and strategy.position_size == 0
+    // position just closed on this bar; prevPosSize contains the prior position size and sign
+    // check if it closed at the planned TP (within tolerance)
+    tolPrice = tolTicksAfterTP * syminfo.mintick
+    if not na(lastPlannedTP)
+        if prevPosSize > 0
+            // long closed
+            if math.abs(close - lastPlannedTP) <= tolPrice
+                lastExitWasTP := true
+                lastTPPrice := lastPlannedTP
+                lastTPBar := bar_index
+                barsSinceTP := 0
+            else
+                lastExitWasTP := false
+        else if prevPosSize < 0
+            // short closed
+            if math.abs(close - lastPlannedTP) <= tolPrice
+                lastExitWasTP := true
+                lastTPPrice := lastPlannedTP
+                lastTPBar := bar_index
+                barsSinceTP := 0
+            else
+                lastExitWasTP := false
+        // clear planned TP/SL since we've processed the close
+        lastPlannedTP := na
+        lastPlannedSL := na
+
+// increment barsSinceTP if we've recorded one previously
+if not na(lastTPBar)
+    barsSinceTP += 1
+
+// finally update prevPosSize for next-bar comparison (do this after detection)
+prevPosSize := strategy.position_size
+
+// =====================
+// === ENTRY GATING (OPTIONAL: use TP-blocking / retrace - example minimal gating) ===
+// Example simple gating: block re-entry for cooldown bars after a TP (can be extended as earlier discussed)
+cooldownBarsAfterTP = input.int(3, "Cooldown after TP (bars)", minval=0)
+allowEntryAfterTP_long() =>
+    if not lastExitWasTP
+        true
+    else
+        barsSinceTP >= cooldownBarsAfterTP
+
+allowEntryAfterTP_short() =>
+    if not lastExitWasTP
+        true
+    else
+        barsSinceTP >= cooldownBarsAfterTP
+
+// Combine gating with raw conditions
+finalBuyCond = buyCond_raw and allowEntryAfterTP_long()
+finalSellCond = sellCond_raw and allowEntryAfterTP_short()
+
+// NOTE: If you want more advanced retracement gating (ATR/percent/EMA), replace allowEntryAfterTP_* with the more detailed checks provided earlier.
+
+// =====================
+// === EMA-BASED COUNTER-TREND EXIT LOGIC (unchanged) ===
+// (You can keep the EMA exit logic from your previous script. For brevity it's re-included here.)
+
+// EMA exit settings (re-use same inputs or add new ones if you previously had them)
+emaExitEnabled       = input.bool(true, "Enable EMA counter-trend exit?")
+emaExitMode          = input.string("Market Close", "EMA Exit Mode", options=["Market Close", "Set Stop at EMA"])
+emaExitBufferTicks   = input.int(1, "EMA Exit buffer (ticks) when using 'Set Stop at EMA'", minval=0)
+emaExitSendWebhook   = input.bool(true, "Send webhook on EMA exit?")
+
+emaBufPrice = emaTrend
+if emaExitMode == "Set Stop at EMA"
+    emaBufPrice := emaTrend + (emaExitBufferTicks * tick)  // will be used when building stops
+
+exit_payload_long = connectorFormat == "PineConnector CSV" ? (pine_license_id + ",EXIT," + symbol_out + "," + str.tostring(math.abs(strategy.position_size), format.mintick) + ",NULL,NULL,ema_exit") : ('{"action":"EXIT","symbol":"' + symbol_out + '","side":"LONG","size":' + str.tostring(math.abs(strategy.position_size), format.mintick) + ',"reason":"EMA_EXIT"}')
+exit_payload_short = connectorFormat == "PineConnector CSV" ? (pine_license_id + ",EXIT," + symbol_out + "," + str.tostring(math.abs(strategy.position_size), format.mintick) + ",NULL,NULL,ema_exit") : ('{"action":"EXIT","symbol":"' + symbol_out + '","side":"SHORT","size":' + str.tostring(math.abs(strategy.position_size), format.mintick) + ',"reason":"EMA_EXIT"}')
+
+emaCrossDown = ta.crossunder(close, emaTrend)  // price crossed below EMA
+emaCrossUp   = ta.crossover(close, emaTrend)   // price crossed above EMA
+
+if emaExitEnabled and strategy.position_size > 0
+    if emaExitMode == "Market Close"
+        if emaCrossDown
+            strategy.close("LONG_ENTRY")
+            if emaExitSendWebhook and sendAlertsFromScript
+                alert(exit_payload_long, alert.freq_once_per_bar_close)
+    else
+        ema_stop_long = emaTrend - (emaExitBufferTicks * tick)
+        strategy.exit(id="EMA_PROT_LONG", from_entry="LONG_ENTRY", stop=ema_stop_long)
+        var float prev_ema_stop_long = na
+        if na(prev_ema_stop_long) or prev_ema_stop_long != ema_stop_long
+            prev_ema_stop_long := ema_stop_long
+            if emaExitSendWebhook and sendAlertsFromScript
+                alert('{"action":"SET_STOP","symbol":"' + symbol_out + '","side":"LONG","stop_price":' + f_format_price(ema_stop_long) + ',"reason":"EMA_PROT"}', alert.freq_once_per_bar_close)
+
+if emaExitEnabled and strategy.position_size < 0
+    if emaExitMode == "Market Close"
+        if emaCrossUp
+            strategy.close("SHORT_ENTRY")
+            if emaExitSendWebhook and sendAlertsFromScript
+                alert(exit_payload_short, alert.freq_once_per_bar_close)
+    else
+        ema_stop_short = emaTrend + (emaExitBufferTicks * tick)
+        strategy.exit(id="EMA_PROT_SHORT", from_entry="SHORT_ENTRY", stop=ema_stop_short)
+        var float prev_ema_stop_short = na
+        if na(prev_ema_stop_short) or prev_ema_stop_short != ema_stop_short
+            prev_ema_stop_short := ema_stop_short
+            if emaExitSendWebhook and sendAlertsFromScript
+                alert('{"action":"SET_STOP","symbol":"' + symbol_out + '","side":"SHORT","stop_price":' + f_format_price(ema_stop_short) + ',"reason":"EMA_PROT"}', alert.freq_once_per_bar_close)
+
+// =====================
+// === EXIT PROCESS (existing Percent stop/tp/trail) ===
+var float longStop   = na
+var float longTP     = na
+var float shortStop  = na
+var float shortTP    = na
+var float trailPointsLong = na
+var float trailPointsShort = na
+
+if useStops and stopType == "Percent"
+    if strategy.position_size > 0
+        entryPrice = strategy.position_avg_price
+        longStop := entryPrice * (1 - stopLossValue / 100) - buf
+        longTP   := entryPrice * (1 + takeProfitValue / 100)
+        trailPointsLong := useTrailingStop ? (entryPrice * (trailPercent / 100)) : na
+    else
+        longStop := na
+        longTP := na
+        trailPointsLong := na
+
+    if strategy.position_size < 0
+        entryPrice = strategy.position_avg_price
+        shortStop := entryPrice * (1 + stopLossValue / 100) + buf
+        shortTP   := entryPrice * (1 - takeProfitValue / 100)
+        trailPointsShort := useTrailingStop ? (entryPrice * (trailPercent / 100)) : na
+    else
+        shortStop := na
+        shortTP := na
+        trailPointsShort := na
+else
+    longStop := na
+    longTP := na
+    shortStop := na
+    shortTP := na
+    trailPointsLong := na
+    trailPointsShort := na
+
+if strategy.position_size > 0
+    if useStops and stopType == "Percent"
+        if not na(trailPointsLong)
+            strategy.exit(id="LONG_EXIT", from_entry="LONG_ENTRY", stop=longStop, limit=longTP, trail_points=trailPointsLong)
+        else
+            strategy.exit(id="LONG_EXIT", from_entry="LONG_ENTRY", stop=longStop, limit=longTP)
+
+if strategy.position_size < 0
+    if useStops and stopType == "Percent"
+        if not na(trailPointsShort)
+            strategy.exit(id="SHORT_EXIT", from_entry="SHORT_ENTRY", stop=shortStop, limit=shortTP, trail_points=trailPointsShort)
+        else
+            strategy.exit(id="SHORT_EXIT", from_entry="SHORT_ENTRY", stop=shortStop, limit=shortTP)
+
+// =====================
+// === VISUALS / DEBUG ===
+plot(emaTrend, title="EMA Trend", color=color.orange)
+plotshape(finalBuyCond, title="Buy Marker", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small)
+plotshape(finalSellCond, title="Sell Marker", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+// Mark TP exit event visually if one was recorded recently
+plotshape(not na(lastTPBar) and bar_index == lastTPBar ? true : false, title="TP Exit Marker", location=location.abovebar, color=color.fuchsia, style=shape.xcross, size=size.small)
+
+var table infoBox = table.new(position.top_right, 1, 9)
+table.clear(infoBox, 0, 0, 0, 8)
+trendText  = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "NEUTRAL"
+trendColor = bullTrend ? color.new(color.green, 0) : bearTrend ? color.new(color.red, 0) : color.new(color.gray, 0)
+posSize = strategy.position_size
+posPL   = strategy.openprofit
+float plPct = na
+if strategy.position_size != 0 and strategy.position_avg_price != 0
+    plPct := posPL / (strategy.position_avg_price * math.abs(strategy.position_size)) * 100
+else
+    plPct := 0.0
+string plText = posSize == 0 ? "0" : (str.tostring(posPL, format.mintick) + " (" + str.tostring(plPct, format.percent) + ")")
+color plColor = posPL > 0 ? color.new(color.green, 0) : posPL < 0 ? color.new(color.red, 0) : color.new(color.gray, 0)
+posDir  = posSize > 0 ? "LONG" : posSize < 0 ? "SHORT" : "NONE"
+stopsStatus = useStops ? (useTrailingStop ? "Trailing ON" : "Fixed ON") : "Disabled"
+
+table.cell(infoBox, 0, 0, "📊  MACD Momentum (Variant 5) — TP detection fixed", text_color=color.yellow, bgcolor=color.new(color.black, 80))
+table.cell(infoBox, 0, 1, "Trend: " + trendText, text_color=color.white, bgcolor=trendColor)
+table.cell(infoBox, 0, 2, "BuyCond: " + (buyCond_raw ? "YES" : "NO"), text_color=color.white, bgcolor=color.new(color.blue, 60))
+table.cell(infoBox, 0, 3, "Hist/Vol/Candle: " + (histRising ? "H" : "-") + "/" + (volOk ? "V" : "-") + "/" + (confirmBull ? "C" : "-"), text_color=color.white, bgcolor=color.new(color.gray, 70))
+table.cell(infoBox, 0, 4, "Last TP: " + (not na(lastTPPrice) ? f_format_price(lastTPPrice) : "None"), text_color=color.white, bgcolor=color.new(color.black, 60))
+table.cell(infoBox, 0, 5, "Bars since TP: " + str.tostring(barsSinceTP), text_color=color.white, bgcolor=color.new(color.black, 60))
+table.cell(infoBox, 0, 6, "Last Signal: " + lastSignalSent, text_color=color.white, bgcolor=color.new(color.black, 60))
+table.cell(infoBox, 0, 7, "Position: " + posDir, text_color=color.white, bgcolor=color.new(color.gray, 70))
+table.cell(infoBox, 0, 8, "P/L: " + plText, text_color=color.white, bgcolor=plColor)
